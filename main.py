@@ -3,12 +3,10 @@ from pydantic import BaseModel
 from typing import List
 import openai
 import os
-import json
-import re
 
 app = FastAPI()
 
-# Load API Key from environment
+# Load API key from environment variable
 openai.api_key = os.getenv("OPENAI_API_KEY")
 MODEL = "gpt-4o"
 
@@ -16,58 +14,30 @@ class NameValidationRequest(BaseModel):
     names: List[str]
 
 @app.post("/validate")
-def validate_names(data: NameValidationRequest):
+async def validate_names(data: NameValidationRequest):
     results = []
 
-    for full_input in data.names:
-        # Extract just the first name
-        name_only = extract_first_name(full_input)
-
+    for name in data.names:
         try:
-            response = openai.ChatCompletion.create(
+            messages = [
+                {"role": "system", "content": "You are an expert in first name validation."},
+                {"role": "user", "content": f"Is '{name}' a valid American first name? Respond ONLY in this format as JSON: {{\"name\": \"{name}\", \"valid\": true/false, \"score\": 1-10, \"human_review\": true/false}}"}
+            ]
+
+            response = openai.chat.completions.create(
                 model=MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that validates if a given string is a real American first name. Respond ONLY in strict JSON like this: {\"name\": \"Dylan\", \"valid\": true, \"score\": 9}"},
-                    {"role": "user", "content": f"Is '{name_only}' a valid American first name? Respond only with JSON."}
-                ]
+                messages=messages,
+                temperature=0
             )
 
-            ai_output = response["choices"][0]["message"]["content"]
+            answer = response.choices[0].message.content.strip()
 
-            # Try to parse JSON safely
-            parsed = json.loads(ai_output)
-
-            # Add human_review flag based on confidence
-            score = parsed.get("score", 0)
-            human_review = score < 7
-
-            results.append({
-                "input": full_input,
-                "name": parsed.get("name", name_only),
-                "valid": parsed.get("valid", False),
-                "score": score,
-                "human_review": human_review
-            })
+            # Attempt to parse the assistant's JSON response
+            parsed = eval(answer)  # use json.loads(answer) if output is strict JSON
+            parsed["input"] = name
+            results.append(parsed)
 
         except Exception as e:
-            results.append({
-                "input": full_input,
-                "name": name_only,
-                "error": str(e)
-            })
+            results.append({"input": name, "name": name, "error": str(e)})
 
     return {"results": results}
-
-def extract_first_name(raw: str) -> str:
-    """
-    Cleans and extracts the first name from a full string.
-    Handles cases like "John Smith", "Smith, John", "Dylan and Shaya"
-    """
-    # Split on comma
-    if ',' in raw:
-        parts = raw.split(',')
-        return parts[1].strip() if len(parts) > 1 else parts[0].strip()
-
-    # Split on "and" or space and take first
-    parts = re.split(r'\s+and\s+|\s+', raw)
-    return parts[0].strip()

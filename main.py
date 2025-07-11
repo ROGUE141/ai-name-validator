@@ -30,3 +30,7 @@ def validate_names(data: NameValidationRequest):
         except Exception as e:
             results.append({"input": name, "error": str(e)})
     return {"results": results}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)

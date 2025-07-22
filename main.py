@@ -12,6 +12,7 @@ MODEL = "gpt-4o"
 
 GOOGLE_APPS_SCRIPT_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxhGyMtVKEzcdz0PovIwzHigpOvkL2ZMw2O9EuMvwqQx9DKnLJ7xgcMgxAwuJLLHI6x/exec"
 
+# --- Data Models ---
 class NameEntry(BaseModel):
     row: int
     name: str
@@ -21,6 +22,7 @@ class NameValidationRequest(BaseModel):
     sheetName: str
     names: List[NameEntry]
 
+# --- Main Endpoint ---
 @app.post("/validate")
 def validate_names(data: NameValidationRequest):
     print(f"🔵 Received request for tab: {data.sheetName} with {len(data.names)} names.")
@@ -110,6 +112,7 @@ def validate_names(data: NameValidationRequest):
 
     return {"results": results_for_api}
 
+# --- Helper Function ---
 def parse_validation_response(text: str) -> Dict[str, Any]:
     result = {
         "valid": None,

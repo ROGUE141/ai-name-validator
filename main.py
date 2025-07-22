@@ -48,11 +48,15 @@ def validate_names(data: NameValidationRequest):
                 parsed = parse_validation_response(answer)
                 print(f"🟢 AI response for '{name}':", parsed)
 
+                # Calculate our own human_review flag
+                score = parsed.get("score")
+                human_review_flag = score is None or float(score) < 6
+
                 name_results.append({
                     "name": name,
                     "valid": parsed.get("valid"),
-                    "score": parsed.get("score"),
-                    "human_review": parsed.get("human_review")
+                    "score": score,
+                    "human_review": human_review_flag
                 })
 
             except Exception as e:
@@ -61,11 +65,11 @@ def validate_names(data: NameValidationRequest):
                     "name": name,
                     "valid": "error",
                     "score": None,
-                    "human_review": str(e)
+                    "human_review": True
                 })
 
         top_name = name_results[0] if name_results else {
-            "name": "", "valid": "No", "score": 0, "human_review": "No names found"
+            "name": "", "valid": "No", "score": 0, "human_review": True
         }
 
         results_for_sheet.append({
@@ -103,7 +107,7 @@ def parse_validation_response(text: str) -> Dict[str, Any]:
     result = {
         "valid": None,
         "score": None,
-        "human_review": None
+        "human_review": None  # this is ignored now
     }
 
     for line in text.splitlines():
@@ -116,6 +120,6 @@ def parse_validation_response(text: str) -> Dict[str, Any]:
             except:
                 result["score"] = None
         elif "human_review" in line:
-            result["human_review"] = "true" in line
+            result["human_review"] = "true" in line  # no longer used
 
     return result

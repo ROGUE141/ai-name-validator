@@ -10,11 +10,11 @@ app = FastAPI()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = "gpt-4o"
 
-# Your Web App URL for writeback
 GOOGLE_APPS_SCRIPT_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxhGyMtVKEzcdz0PovIwzHigpOvkL2ZMw2O9EuMvwqQx9DKnLJ7xgcMgxAwuJLLHI6x/exec"
 
 class NameValidationRequest(BaseModel):
     sheetId: str
+    sheetName: str  # ✅ Add sheetName support
     names: List[str]
 
 @app.post("/validate")
@@ -24,7 +24,6 @@ def validate_names(data: NameValidationRequest):
 
     for i, input_name in enumerate(data.names):
         name_results = []
-
         cleaned = (
             input_name.replace(",", " and ")
                       .replace("&", " and ")
@@ -68,7 +67,7 @@ def validate_names(data: NameValidationRequest):
         results_for_sheet.append({
             "row": i + 2,
             "name": top_name.get("name", ""),
-            "valid": "Yes" if top_name.get("valid") == True or top_name.get("valid") == "yes" else "No",
+            "valid": "Yes" if top_name.get("valid") in [True, "yes"] else "No",
             "score": top_name.get("score"),
             "human_review": top_name.get("human_review")
         })
@@ -83,6 +82,7 @@ def validate_names(data: NameValidationRequest):
             GOOGLE_APPS_SCRIPT_WEBHOOK_URL,
             json={
                 "sheetId": data.sheetId,
+                "sheetName": data.sheetName,  # ✅ Include sheet name
                 "results": results_for_sheet
             }
         )

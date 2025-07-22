@@ -81,7 +81,7 @@ def validate_names(data: NameValidationRequest):
         }
 
         results_for_sheet.append({
-            "row": row_number,  # ✅ Correct row, no extra +1
+            "row": row_number - 1,  # ✅ Correct row, no extra +1
             "input": input_name,
             "name": top_name.get("name", ""),
             "valid": "Yes" if top_name.get("valid") in [True, "yes"] else "No",

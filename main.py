@@ -14,7 +14,7 @@ GOOGLE_APPS_SCRIPT_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxhGyM
 
 class NameValidationRequest(BaseModel):
     sheetId: str
-    sheetName: str  # ✅ Add sheetName support
+    sheetName: str
     names: List[str]
 
 @app.post("/validate")
@@ -64,8 +64,10 @@ def validate_names(data: NameValidationRequest):
             "name": "", "valid": "No", "score": 0, "human_review": "No names found"
         }
 
+        # ✅ Return all necessary values to Sheets
         results_for_sheet.append({
             "row": i + 2,
+            "input": input_name,
             "name": top_name.get("name", ""),
             "valid": "Yes" if top_name.get("valid") in [True, "yes"] else "No",
             "score": top_name.get("score"),
@@ -82,7 +84,7 @@ def validate_names(data: NameValidationRequest):
             GOOGLE_APPS_SCRIPT_WEBHOOK_URL,
             json={
                 "sheetId": data.sheetId,
-                "sheetName": data.sheetName,  # ✅ Include sheet name
+                "sheetName": data.sheetName,
                 "results": results_for_sheet
             }
         )
@@ -91,7 +93,6 @@ def validate_names(data: NameValidationRequest):
         print("Error posting to Google Sheets:", str(e))
 
     return {"results": results_for_api}
-
 
 def parse_validation_response(text: str) -> Dict[str, Any]:
     result = {

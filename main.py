@@ -12,10 +12,14 @@ MODEL = "gpt-4o"
 
 GOOGLE_APPS_SCRIPT_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxhGyMtVKEzcdz0PovIwzHigpOvkL2ZMw2O9EuMvwqQx9DKnLJ7xgcMgxAwuJLLHI6x/exec"
 
+class NameEntry(BaseModel):
+    row: int
+    name: str
+
 class NameValidationRequest(BaseModel):
     sheetId: str
     sheetName: str
-    names: List[str]
+    names: List[NameEntry]
 
 @app.post("/validate")
 def validate_names(data: NameValidationRequest):
@@ -24,8 +28,11 @@ def validate_names(data: NameValidationRequest):
     results_for_sheet = []
     results_for_api = []
 
-    for i, input_name in enumerate(data.names):
+    for entry in data.names:
+        row_number = entry.row
+        input_name = entry.name
         name_results = []
+
         cleaned = (
             input_name.replace(",", " and ")
                       .replace("&", " and ")
@@ -48,7 +55,6 @@ def validate_names(data: NameValidationRequest):
                 parsed = parse_validation_response(answer)
                 print(f"🟢 AI response for '{name}':", parsed)
 
-                # Calculate our own human_review flag
                 score = parsed.get("score")
                 human_review_flag = score is None or float(score) < 6
 
@@ -73,7 +79,7 @@ def validate_names(data: NameValidationRequest):
         }
 
         results_for_sheet.append({
-            "row": i + 2,
+            "row": row_number,
             "input": input_name,
             "name": top_name.get("name", ""),
             "valid": "Yes" if top_name.get("valid") in [True, "yes"] else "No",
@@ -83,6 +89,7 @@ def validate_names(data: NameValidationRequest):
 
         results_for_api.append({
             "input": input_name,
+            "row": row_number,
             "names": name_results
         })
 
@@ -107,7 +114,7 @@ def parse_validation_response(text: str) -> Dict[str, Any]:
     result = {
         "valid": None,
         "score": None,
-        "human_review": None  # this is ignored now
+        "human_review": None
     }
 
     for line in text.splitlines():
@@ -120,6 +127,6 @@ def parse_validation_response(text: str) -> Dict[str, Any]:
             except:
                 result["score"] = None
         elif "human_review" in line:
-            result["human_review"] = "true" in line  # no longer used
+            result["human_review"] = "true" in line
 
     return result

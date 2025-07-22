@@ -19,6 +19,8 @@ class NameValidationRequest(BaseModel):
 
 @app.post("/validate")
 def validate_names(data: NameValidationRequest):
+    print(f"🔵 Received request for tab: {data.sheetName} with {len(data.names)} names.")
+
     results_for_sheet = []
     results_for_api = []
 
@@ -44,6 +46,7 @@ def validate_names(data: NameValidationRequest):
 
                 answer = response.choices[0].message.content.strip()
                 parsed = parse_validation_response(answer)
+                print(f"🟢 AI response for '{name}':", parsed)
 
                 name_results.append({
                     "name": name,
@@ -53,6 +56,7 @@ def validate_names(data: NameValidationRequest):
                 })
 
             except Exception as e:
+                print(f"🔴 Error validating '{name}': {e}")
                 name_results.append({
                     "name": name,
                     "valid": "error",
@@ -64,13 +68,12 @@ def validate_names(data: NameValidationRequest):
             "name": "", "valid": "No", "score": 0, "human_review": "No names found"
         }
 
-        # ✅ Return all necessary values to Sheets
         results_for_sheet.append({
             "row": i + 2,
             "input": input_name,
             "name": top_name.get("name", ""),
             "valid": "Yes" if top_name.get("valid") in [True, "yes"] else "No",
-            "score": top_name.get("score"),
+            "score": top_name.get("score") if isinstance(top_name.get("score"), (int, float)) else "",
             "human_review": top_name.get("human_review")
         })
 
@@ -78,6 +81,8 @@ def validate_names(data: NameValidationRequest):
             "input": input_name,
             "names": name_results
         })
+
+    print("📤 Posting results to Web App:", results_for_sheet)
 
     try:
         response = requests.post(
@@ -88,9 +93,9 @@ def validate_names(data: NameValidationRequest):
                 "results": results_for_sheet
             }
         )
-        print("POST to Google Sheets:", response.status_code, response.text)
+        print("✅ POST to Google Sheets:", response.status_code, response.text)
     except Exception as e:
-        print("Error posting to Google Sheets:", str(e))
+        print("🔴 Error posting to Google Sheets:", str(e))
 
     return {"results": results_for_api}
 

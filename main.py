@@ -1,17 +1,21 @@
 # main.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Dict, Any, Tuple
 import os
 import time
 import hashlib
 import threading
+from typing import List, Dict, Any, Tuple
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import openai
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 
-# --- App & Clients ---
+# -------------------------
+# App & Clients
+# -------------------------
 app = FastAPI()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -21,20 +25,33 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-# Your Apps Script Web App endpoint
+# Your Apps Script Web App endpoint (can override in Render env)
 GOOGLE_APPS_SCRIPT_WEBHOOK_URL = os.getenv(
     "GOOGLE_APPS_SCRIPT_WEBHOOK_URL",
     "https://script.google.com/macros/s/AKfycbxhGyMtVKEzcdz0PovIwzHigpOvkL2ZMw2O9EuMvwqQx9DKnLJ7xgcMgxAwuJLLHI6x/exec",
 )
 
-# Concurrency (tune as needed)
+# Concurrency (tune in Render → Environment)
 VALIDATOR_WORKERS = int(os.getenv("VALIDATOR_WORKERS", "20"))
 
-# --- In-memory idempotency (prevents duplicate writes on retry) ---
+# -------------------------
+# Health / Warm-up endpoints
+# -------------------------
+@app.get("/", response_class=PlainTextResponse)
+def root_health():
+    # Simple warm-up / health endpoint for Render & Apps Script pings
+    return "OK"
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "OK"
+
+# -------------------------
+# In-memory idempotency cache (prevents double writes on retry)
+# -------------------------
 _IDEMPOTENCY: Dict[str, float] = {}
 _ID_LOCK = threading.Lock()
 _ID_TTL_SECONDS = 10 * 60  # 10 minutes
-
 
 def _make_idempotency_key(sheet_id: str, sheet_name: str, rows: List[int]) -> str:
     if not rows:
@@ -43,34 +60,34 @@ def _make_idempotency_key(sheet_id: str, sheet_name: str, rows: List[int]) -> st
         base = f"{sheet_id}:{sheet_name}:{min(rows)}-{max(rows)}:{len(rows)}"
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
-
 def _already_processed(key: str) -> bool:
     """Return True if we've seen this key recently; else remember it."""
     now = time.time()
     with _ID_LOCK:
-        # Purge old
-        expired = [k for k, ts in _IDEMPOTENCY.items() if now - ts > _ID_TTL_SECONDS]
-        for k in expired:
-            _IDEMPOTENCY.pop(k, None)
+        # Purge old entries
+        for k, ts in list(_IDEMPOTENCY.items()):
+            if now - ts > _ID_TTL_SECONDS:
+                _IDEMPOTENCY.pop(k, None)
         if key in _IDEMPOTENCY:
             return True
         _IDEMPOTENCY[key] = now
         return False
 
-
-# --- Models ---
+# -------------------------
+# Request models
+# -------------------------
 class NameEntry(BaseModel):
     row: int
     name: str
-
 
 class NameValidationRequest(BaseModel):
     sheetId: str
     sheetName: str
     names: List[NameEntry]
 
-
-# --- Helpers ---
+# -------------------------
+# Helpers
+# -------------------------
 def parse_validation_response(text: str) -> Dict[str, Any]:
     """
     Expected lines:
@@ -92,11 +109,10 @@ def parse_validation_response(text: str) -> Dict[str, Any]:
             out["human_review"] = "true" in low
     return out
 
-
 def pick_first_token_as_name(input_name: str) -> str:
     """
-    Your original code split by 'and' and whitespace, then used the first candidate (index 0).
-    We keep the same intent: validate the first plausible first-name token.
+    Keep original intent: validate the first plausible first-name token.
+    Splits by 'and', '&', commas, whitespace; returns the first token.
     """
     if not input_name:
         return ""
@@ -106,13 +122,11 @@ def pick_first_token_as_name(input_name: str) -> str:
         .replace("  ", " ")
         .strip()
     )
-    # split on "and", then split each part on whitespace; pick the first token
     for part in cleaned.split(" and "):
         tokens = [t for t in part.strip().split() if t]
         if tokens:
             return tokens[0]
     return ""
-
 
 def validate_one_name(name_str: str) -> Dict[str, Any]:
     """
@@ -160,32 +174,25 @@ def validate_one_name(name_str: str) -> Dict[str, Any]:
             "human_review": True,
         }
 
-
-def validate_batch_parallel(
-    entries: List[NameEntry], max_workers: int
-) -> Tuple[List[Dict[str, Any]], int]:
+def validate_batch_parallel(entries: List[NameEntry], max_workers: int) -> Tuple[List[Dict[str, Any]], int]:
     """
     Validate the first plausible token for each entry in parallel.
     Returns (results_for_sheet, validate_ms)
     """
     t0 = time.time()
-    # pick first candidate token per entry
     candidates = [(e.row, pick_first_token_as_name(e.name), e.name) for e in entries]
 
     results_for_sheet: List[Dict[str, Any]] = []
 
-    # thread pool for parallel OpenAI calls
+    # Thread pool for parallel OpenAI calls
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(validate_one_name, cand_name): (row, raw_input)
-            for (row, cand_name, raw_input) in candidates
-        }
+        futures = {pool.submit(validate_one_name, cand_name): (row, raw_input)
+                   for (row, cand_name, raw_input) in candidates}
         for fut in as_completed(futures):
             row, raw_input = futures[fut]
             try:
                 r = fut.result()
             except Exception:
-                # Extremely defensive fallback
                 r = {"normalized_name": "", "valid": False, "score": 0, "human_review": True}
 
             results_for_sheet.append(
@@ -203,7 +210,6 @@ def validate_batch_parallel(
     validate_ms = int((time.time() - t0) * 1000)
     return results_for_sheet, validate_ms
 
-
 def post_results_once(
     sheet_id: str,
     sheet_name: str,
@@ -211,16 +217,15 @@ def post_results_once(
     idempotency_key: str,
 ) -> Dict[str, Any]:
     """
-    Single POST to the Apps Script Web App with retries/backoff.
+    Single POST to the Apps Script Web App with light retries/backoff.
     """
-    # if duplicate, skip the write and return fast
+    # Skip duplicate writes (process-once semantics)
     if _already_processed(idempotency_key):
         return {"status": "duplicate_skipped", "idempotency_key": idempotency_key, "http_status": 200}
 
     payload = {"sheetId": sheet_id, "sheetName": sheet_name, "results": results_for_sheet}
     headers = {"X-Idempotency-Key": idempotency_key}
 
-    # small retry loop for transient network issues
     base_delay = 1.0
     last_exc = None
     for attempt in range(1, 4):
@@ -244,17 +249,17 @@ def post_results_once(
             last_exc = e
             time.sleep(base_delay)
             base_delay *= 2  # 1s -> 2s -> 4s
-    # final failure
     return {"status": "post_failed", "error": str(last_exc), "idempotency_key": idempotency_key}
 
-
-# --- Endpoint ---
+# -------------------------
+# Main endpoint
+# -------------------------
 @app.post("/validate")
 def validate_names(data: NameValidationRequest):
     """
-    Fast path:
+    Pipeline:
       1) Validate N names in parallel (first token per row).
-      2) Single POST to Apps Script Web App.
+      2) Single POST to Apps Script Web App (idempotent).
       3) Return structured timings.
     """
     count = len(data.names)
@@ -268,7 +273,7 @@ def validate_names(data: NameValidationRequest):
     idem_key = _make_idempotency_key(data.sheetId, data.sheetName, rows)
     webapp_info = post_results_once(data.sheetId, data.sheetName, results_for_sheet, idem_key)
 
-    # 3) Build API-style detail (optional diagnostic)
+    # 3) Build API-style detail (optional; handy for debugging)
     results_for_api = [
         {
             "row": r["row"],

@@ -1,135 +1,300 @@
+# main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict, Any
-import openai
+from typing import List, Dict, Any, Tuple
 import os
-import requests
+import time
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+import openai
+
+# --- App & Clients ---
 app = FastAPI()
 
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MODEL = "gpt-4o"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-GOOGLE_APPS_SCRIPT_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxhGyMtVKEzcdz0PovIwzHigpOvkL2ZMw2O9EuMvwqQx9DKnLJ7xgcMgxAwuJLLHI6x/exec"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-# --- Data Models ---
+# Your Apps Script Web App endpoint
+GOOGLE_APPS_SCRIPT_WEBHOOK_URL = os.getenv(
+    "GOOGLE_APPS_SCRIPT_WEBHOOK_URL",
+    "https://script.google.com/macros/s/AKfycbxhGyMtVKEzcdz0PovIwzHigpOvkL2ZMw2O9EuMvwqQx9DKnLJ7xgcMgxAwuJLLHI6x/exec",
+)
+
+# Concurrency (tune as needed)
+VALIDATOR_WORKERS = int(os.getenv("VALIDATOR_WORKERS", "20"))
+
+# --- In-memory idempotency (prevents duplicate writes on retry) ---
+_IDEMPOTENCY: Dict[str, float] = {}
+_ID_LOCK = threading.Lock()
+_ID_TTL_SECONDS = 10 * 60  # 10 minutes
+
+
+def _make_idempotency_key(sheet_id: str, sheet_name: str, rows: List[int]) -> str:
+    if not rows:
+        base = f"{sheet_id}:{sheet_name}:empty"
+    else:
+        base = f"{sheet_id}:{sheet_name}:{min(rows)}-{max(rows)}:{len(rows)}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def _already_processed(key: str) -> bool:
+    """Return True if we've seen this key recently; else remember it."""
+    now = time.time()
+    with _ID_LOCK:
+        # Purge old
+        expired = [k for k, ts in _IDEMPOTENCY.items() if now - ts > _ID_TTL_SECONDS]
+        for k in expired:
+            _IDEMPOTENCY.pop(k, None)
+        if key in _IDEMPOTENCY:
+            return True
+        _IDEMPOTENCY[key] = now
+        return False
+
+
+# --- Models ---
 class NameEntry(BaseModel):
     row: int
     name: str
+
 
 class NameValidationRequest(BaseModel):
     sheetId: str
     sheetName: str
     names: List[NameEntry]
 
-# --- Main Endpoint ---
-@app.post("/validate")
-def validate_names(data: NameValidationRequest):
-    print(f"🔵 Received request for tab: {data.sheetName} with {len(data.names)} names.")
 
-    results_for_sheet = []
-    results_for_api = []
-
-    for entry in data.names:
-        row_number = entry.row
-        input_name = entry.name
-        name_results = []
-
-        cleaned = (
-            input_name.replace(",", " and ")
-                      .replace("&", " and ")
-                      .replace("  ", " ")
-                      .strip()
-        )
-        name_parts = [n.strip() for part in cleaned.split(" and ") for n in part.split() if n]
-
-        for name in name_parts:
+# --- Helpers ---
+def parse_validation_response(text: str) -> Dict[str, Any]:
+    """
+    Expected lines:
+      valid: yes/no
+      score: 0-10
+      human_review: true/false
+    """
+    out = {"valid": None, "score": None, "human_review": None}
+    for line in (text or "").splitlines():
+        low = line.strip().lower()
+        if low.startswith("valid"):
+            out["valid"] = "yes" in low
+        elif low.startswith("score"):
             try:
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are an expert in American first names."},
-                        {"role": "user", "content": f"Is '{name}' a valid American first name? Respond only with:\nvalid: yes/no\nscore: (0-10)\nhuman_review: true/false"}
-                    ]
-                )
+                out["score"] = float(low.split(":", 1)[1].strip())
+            except Exception:
+                out["score"] = None
+        elif low.startswith("human_review"):
+            out["human_review"] = "true" in low
+    return out
 
-                answer = response.choices[0].message.content.strip()
-                parsed = parse_validation_response(answer)
-                print(f"🟢 AI response for '{name}':", parsed)
 
-                score = parsed.get("score")
-                human_review_flag = score is None or float(score) < 6
+def pick_first_token_as_name(input_name: str) -> str:
+    """
+    Your original code split by 'and' and whitespace, then used the first candidate (index 0).
+    We keep the same intent: validate the first plausible first-name token.
+    """
+    if not input_name:
+        return ""
+    cleaned = (
+        input_name.replace(",", " and ")
+        .replace("&", " and ")
+        .replace("  ", " ")
+        .strip()
+    )
+    # split on "and", then split each part on whitespace; pick the first token
+    for part in cleaned.split(" and "):
+        tokens = [t for t in part.strip().split() if t]
+        if tokens:
+            return tokens[0]
+    return ""
 
-                name_results.append({
-                    "name": name,
-                    "valid": parsed.get("valid"),
-                    "score": score,
-                    "human_review": human_review_flag
-                })
 
-            except Exception as e:
-                print(f"🔴 Error validating '{name}': {e}")
-                name_results.append({
-                    "name": name,
-                    "valid": "error",
-                    "score": None,
-                    "human_review": True
-                })
-
-        top_name = name_results[0] if name_results else {
-            "name": "", "valid": "No", "score": 0, "human_review": True
+def validate_one_name(name_str: str) -> Dict[str, Any]:
+    """
+    One OpenAI call per name_str. Returns normalized result dict.
+    """
+    if not name_str:
+        return {
+            "normalized_name": "",
+            "valid": False,
+            "score": 0,
+            "human_review": True,
         }
 
-        results_for_sheet.append({
-            "row": row_number,  # ✅ Correct row, no extra +1
-            "input": input_name,
-            "name": top_name.get("name", ""),
-            "valid": "Yes" if top_name.get("valid") in [True, "yes"] else "No",
-            "score": top_name.get("score") if isinstance(top_name.get("score"), (int, float)) else "",
-            "human_review": top_name.get("human_review")
-        })
-
-        results_for_api.append({
-            "input": input_name,
-            "row": row_number,
-            "names": name_results
-        })
-
-    print("📤 Posting results to Web App:", results_for_sheet)
-
     try:
-        response = requests.post(
-            GOOGLE_APPS_SCRIPT_WEBHOOK_URL,
-            json={
-                "sheetId": data.sheetId,
-                "sheetName": data.sheetName,
-                "results": results_for_sheet
-            }
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": "You are an expert in American first names."},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Is '{name_str}' a valid American first name? Respond only with:\n"
+                        "valid: yes/no\nscore: (0-10)\nhuman_review: true/false"
+                    ),
+                },
+            ],
         )
-        print("✅ POST to Google Sheets:", response.status_code, response.text)
-    except Exception as e:
-        print("🔴 Error posting to Google Sheets:", str(e))
+        answer = (resp.choices[0].message.content or "").strip()
+        parsed = parse_validation_response(answer)
+        score = parsed.get("score")
+        # if score missing or low, flag for human review
+        human_review = score is None or float(score) < 6
+        return {
+            "normalized_name": name_str,
+            "valid": bool(parsed.get("valid") in (True, "yes")),
+            "score": score if isinstance(score, (int, float)) else 0,
+            "human_review": bool(human_review),
+        }
+    except Exception:
+        # On error, be safe: mark invalid and require review
+        return {
+            "normalized_name": name_str,
+            "valid": False,
+            "score": 0,
+            "human_review": True,
+        }
 
-    return {"results": results_for_api}
 
-# --- Helper Function ---
-def parse_validation_response(text: str) -> Dict[str, Any]:
-    result = {
-        "valid": None,
-        "score": None,
-        "human_review": None
-    }
+def validate_batch_parallel(
+    entries: List[NameEntry], max_workers: int
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Validate the first plausible token for each entry in parallel.
+    Returns (results_for_sheet, validate_ms)
+    """
+    t0 = time.time()
+    # pick first candidate token per entry
+    candidates = [(e.row, pick_first_token_as_name(e.name), e.name) for e in entries]
 
-    for line in text.splitlines():
-        line = line.strip().lower()
-        if "valid" in line:
-            result["valid"] = "yes" in line
-        elif "score" in line:
+    results_for_sheet: List[Dict[str, Any]] = []
+
+    # thread pool for parallel OpenAI calls
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(validate_one_name, cand_name): (row, raw_input)
+            for (row, cand_name, raw_input) in candidates
+        }
+        for fut in as_completed(futures):
+            row, raw_input = futures[fut]
             try:
-                result["score"] = float(line.split(":")[1].strip())
-            except:
-                result["score"] = None
-        elif "human_review" in line:
-            result["human_review"] = "true" in line
+                r = fut.result()
+            except Exception:
+                # Extremely defensive fallback
+                r = {"normalized_name": "", "valid": False, "score": 0, "human_review": True}
 
-    return result
+            results_for_sheet.append(
+                {
+                    "row": row,
+                    "input": raw_input,
+                    "name": r.get("normalized_name") or "",
+                    "valid": "Yes" if r.get("valid") else "No",
+                    "score": r.get("score", 0),
+                    "human_review": bool(r.get("human_review", False)),
+                }
+            )
+
+    results_for_sheet.sort(key=lambda x: x["row"])
+    validate_ms = int((time.time() - t0) * 1000)
+    return results_for_sheet, validate_ms
+
+
+def post_results_once(
+    sheet_id: str,
+    sheet_name: str,
+    results_for_sheet: List[Dict[str, Any]],
+    idempotency_key: str,
+) -> Dict[str, Any]:
+    """
+    Single POST to the Apps Script Web App with retries/backoff.
+    """
+    # if duplicate, skip the write and return fast
+    if _already_processed(idempotency_key):
+        return {"status": "duplicate_skipped", "idempotency_key": idempotency_key, "http_status": 200}
+
+    payload = {"sheetId": sheet_id, "sheetName": sheet_name, "results": results_for_sheet}
+    headers = {"X-Idempotency-Key": idempotency_key}
+
+    # small retry loop for transient network issues
+    base_delay = 1.0
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            t1 = time.time()
+            resp = requests.post(
+                GOOGLE_APPS_SCRIPT_WEBHOOK_URL,
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+            elapsed_ms = int((time.time() - t1) * 1000)
+            return {
+                "status": "ok",
+                "http_status": resp.status_code,
+                "elapsed_ms": elapsed_ms,
+                "body": (resp.text or "")[:200],
+                "idempotency_key": idempotency_key,
+            }
+        except Exception as e:
+            last_exc = e
+            time.sleep(base_delay)
+            base_delay *= 2  # 1s -> 2s -> 4s
+    # final failure
+    return {"status": "post_failed", "error": str(last_exc), "idempotency_key": idempotency_key}
+
+
+# --- Endpoint ---
+@app.post("/validate")
+def validate_names(data: NameValidationRequest):
+    """
+    Fast path:
+      1) Validate N names in parallel (first token per row).
+      2) Single POST to Apps Script Web App.
+      3) Return structured timings.
+    """
+    count = len(data.names)
+    print(f"🔵 Received request for tab: {data.sheetName} with {count} names.")
+
+    # 1) Validate in parallel
+    results_for_sheet, validate_ms = validate_batch_parallel(data.names, VALIDATOR_WORKERS)
+
+    # 2) Single POST to Web App (idempotent)
+    rows = [r["row"] for r in results_for_sheet]
+    idem_key = _make_idempotency_key(data.sheetId, data.sheetName, rows)
+    webapp_info = post_results_once(data.sheetId, data.sheetName, results_for_sheet, idem_key)
+
+    # 3) Build API-style detail (optional diagnostic)
+    results_for_api = [
+        {
+            "row": r["row"],
+            "input": r["input"],
+            "names": [
+                {
+                    "name": r["name"],
+                    "valid": r["valid"] == "Yes",
+                    "score": r.get("score", 0),
+                    "human_review": r.get("human_review", False),
+                }
+            ],
+        }
+        for r in results_for_sheet
+    ]
+
+    return {
+        "status": "ok" if webapp_info.get("status") in ("ok", "duplicate_skipped") else "partial",
+        "sheet": data.sheetName,
+        "count": count,
+        "timings": {
+            "validate_ms": validate_ms,
+            "write_ms": webapp_info.get("elapsed_ms", None),
+            "total_ms": (validate_ms + (webapp_info.get("elapsed_ms") or 0)),
+        },
+        "webapp": webapp_info,
+        "idempotency_key": idem_key,
+        "results": results_for_api,
+    }
